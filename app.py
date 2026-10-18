@@ -209,9 +209,26 @@ def extract_dynamic(pages):
 
 def gemini_key():
     try:
-        return st.secrets.get('GEMINI_API_KEY', '') or os.environ.get('GEMINI_API_KEY', '')
+        key = st.secrets.get("GEMINI_API_KEY", "")
+
+        if not key:
+            st.error("Secrets 中找不到 GEMINI_API_KEY")
+            return ""
+
+        if not isinstance(key, str):
+            st.error("API Key 的資料格式不正確")
+            return ""
+
+        if key != key.strip():
+            st.warning("API Key 前後存在空白字元")
+
+        st.success("已成功從 Streamlit Secrets 讀取 API Key")
+
+        return key.strip()
+
     except Exception:
-        return os.environ.get('GEMINI_API_KEY', '')
+        st.error("無法讀取 Streamlit Secrets")
+        return ""
 
 
 def ai_extract(pages, api_key, model_name):
