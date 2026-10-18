@@ -11,8 +11,8 @@ import pandas as pd
 import pdfplumber
 import streamlit as st
 
-st.set_page_config(page_title='工業規格書｜競品比較 MVP v0.7.1', page_icon='📊', layout='wide')
-st.title('工業規格書標準化與競品比較｜MVP v0.7.1')
+st.set_page_config(page_title='工業規格書｜競品比較 MVP v0.8', page_icon='📊', layout='wide')
+st.title('工業規格書標準化與競品比較｜MVP v0.8')
 st.caption('雙 PDF 動態擷取 → 人工修正 → 規格配對 → Excel 比較報告｜規則式／Gemini AI 雙模式；AI 結果需人工確認')
 st.info('僅支援有文字層的 PDF；比較結果為候選資料，須人工確認。請上傳公開或有權使用的文件。')
 
@@ -231,7 +231,7 @@ def gemini_key():
         return ""
 
 
-def gemini_connection_test(api_key, model_name='gemini-2.5-flash'):
+def gemini_connection_test(api_key, model_name='gemini-3.8-flash'):
     """Minimal independent Gemini request. Never include API key in output."""
     if not re.fullmatch(r'[a-zA-Z0-9._-]+', model_name):
         return False, '模型名稱格式不正確。'
@@ -275,6 +275,62 @@ def gemini_connection_test(api_key, model_name='gemini-2.5-flash'):
         return False, '測試發生非預期錯誤，請查看 Streamlit 日誌（勿公開金鑰）。'
 
 
+# v0.8: 固定規格 ID + 適用條件。未知類型保留原欄位，不強制配對。
+FIELD_CATALOG = {
+    'MODEL': '產品型號', 'PART_NUMBER': '料號', 'PRODUCT_TYPE': '產品類型',
+    'INTERFACE': '介面', 'FORM_FACTOR': '外型規格', 'CAPACITY': '容量',
+    'SEQ_READ': '連續讀取速度', 'SEQ_WRITE': '連續寫入速度',
+    'RANDOM_READ': '隨機讀取速度', 'RANDOM_WRITE': '隨機寫入速度',
+    'TBW': '耐寫總量', 'MTBF': '平均故障間隔',
+    'OPERATING_TEMP': '工作溫度', 'STORAGE_TEMP': '儲存溫度',
+    'WARRANTY': '保固', 'SHOCK': '衝擊', 'VIBRATION': '耐震',
+    'MAX_POWER': '最大功耗', 'IDLE_POWER': '閒置功耗',
+    'DIMENSIONS': '尺寸', 'NAND_TYPE': '快閃記憶體類型',
+    'CONNECTOR': '連接器',
+}
+
+# 僅明確同義詞可規則化；不把隨機速度和連續速度混為一談。
+FIELD_SYNONYMS = {
+    '傳輸介面': '介面', '傳輸接口': '介面', '傳輸界面': '介面',
+    '保固年限': '保固', '保固期': '保固', '保固期限': '保固',
+    '抗衝擊': '衝擊', '耐衝擊力': '衝擊', '衝擊耐受度': '衝擊',
+    '作業溫度': '工作溫度', '操作溫度': '工作溫度',
+    '外觀規格': '外型規格', '外觀尺寸': '尺寸',
+    '循序讀取速度': '連續讀取速度', '循序寫入速度': '連續寫入速度',
+    '順序讀取速度': '連續讀取速度', '順序寫入速度': '連續寫入速度',
+    '最大耗電量': '最大功耗', '待機功耗': '閒置功耗',
+}
+
+
+def field_variant(name):
+    """保留容量/版本等限定條件；未知限定條件不猜測。"""
+    name = clean(name)
+    m = re.search(r'[（(]([^()（）]+)[）)]', name)
+    return clean(m.group(1)) if m else ''
+
+
+def normalize_field(name, field_id='', variant=''):
+    raw = clean(name)
+    if field_id in FIELD_CATALOG:
+        base = FIELD_CATALOG[field_id]
+    else:
+        base = re.sub(r'\s*[（(][^()（）]+[）)]', '', raw).strip()
+        base = FIELD_SYNONYMS.get(base, standard_name(base))
+    qualifier = clean(variant) or field_variant(raw)
+    # 不把通用描述或單位當成版本條件。
+    if qualifier and normalized_key(qualifier) not in {'max', 'maximum', '最大', 'min', 'minimum'}:
+        return f'{base}（{qualifier}）'
+    return base
+
+
+def pairing_key(field):
+    field = clean(field)
+    variant = field_variant(field)
+    base = re.sub(r'\s*[（(][^()（）]+[）)]', '', field).strip()
+    base = FIELD_SYNONYMS.get(base, standard_name(base))
+    return normalized_key(base), normalized_key(variant)
+
+
 def ai_extract(pages, api_key, model_name):
     # Send extracted PDF text to Gemini.
     # Cap text size to keep free-tier requests manageable; surface truncation.
@@ -289,12 +345,20 @@ def ai_extract(pages, api_key, model_name):
         remaining -= len(take)
     if not chunks:
         raise ValueError('沒有可供 AI 分析的 PDF 文字。')
-    prompt = """你是工業產品規格書資料擷取助手。請根據下方文件原文擷取明確記載的技術規格，不能補充常識或猜測。
-請輸出一個 JSON 物件，唯一頂層欄位為 specs（陣列），每筆包含：
-label（原始英文/中文欄位名稱）、value（完整原始數值）、standard_field（簡潔繁體中文技術欄位）、page（整數頁碼）、evidence（原文中的短句，必須逐字出現在該頁文字內）。
-每個規格獨立一筆，禁止將不同技術意義的規格混合；不同容量或外型版本必須在 standard_field 中註明適用版本。
-不要將 GB 容量誤當成 Gb/s 傳輸速率。不要推斷缺漏數據；若無法確認頁碼與原文，省略該筆。
-不要輸出 Markdown。文件如下：\n"""
+    prompt = """你是工業產品規格書的嚴格資料擷取助手。只擷取文件明確出現的規格，不得補寫或推測。
+請輸出 JSON 物件，頂層只有 specs 陣列。每筆包含：
+label (原始欄位), value (原始數值), standard_field (繁體中文名稱),
+field_id (以下固定 ID 之一；不適用請用 UNKNOWN),
+variant (適用容量/外型/版本/測試條件；未明示用空字串),
+page (整數頁碼), evidence (逐字出現在該頁原文的短句)。
+可用 ID：""" + ', '.join(FIELD_CATALOG) + """。
+重要規則：
+1. 不同容量、外型或版本的數值分別擷取，variant 必須保留適用條件。
+2. SEQ_READ 與 SEQ_WRITE 必須區分，MAX_POWER 與 IDLE_POWER 必須區分。
+3. 如果文件將讀寫速度合寫為「550 / 510 MB/s」，只有在文件明示順序時才拆成兩筆；否則保留原項目並設 UNKNOWN。
+4. 不得混淆 GB 與 Gb/s。不要推論未提供的值；證據與頁碼無法核實時省略。
+5. evidence 必須是原文中連續出現的文字，不要輸出 Markdown。
+文件如下：\n"""
     payload = {'contents': [{'parts': [{'text': prompt + '\n'.join(chunks)}]}],
                'generationConfig': {'responseMimeType': 'application/json', 'temperature': 0.0}}
     url = 'https://generativelanguage.googleapis.com/v1beta/models/' + model_name + ':generateContent'
@@ -319,6 +383,8 @@ label（原始英文/中文欄位名稱）、value（完整原始數值）、sta
             value = clean(spec['value'])
             evidence = clean(spec['evidence'])
             field = clean(spec['standard_field'])
+            field_id = clean(spec.get('field_id', 'UNKNOWN')).upper()
+            variant = clean(spec.get('variant', ''))
             # Conservative evidence verification: exact evidence appears on the cited page
             # (whitespace normalized to handle PDF extraction line wraps).
             if not label or not value or not field or not evidence or evidence not in clean(page_text.get(pg, '')):
@@ -328,7 +394,7 @@ label（原始英文/中文欄位名稱）、value（完整原始數值）、sta
             if row is None:
                 rejected += 1
                 continue
-            row['標準欄位'] = field
+            row['標準欄位'] = normalize_field(field, field_id, variant)
             row['確認狀態'] = 'AI候選－待人工確認'
             rows.append(row)
         except (KeyError, TypeError, ValueError):
@@ -394,8 +460,8 @@ def match_specs(left, right):
     available = set(range(len(right_rows)))
     output = []
     for a in left_rows:
-        key = normalized_key(a.get('標準欄位') or a.get('原始欄位'))
-        matching = [j for j in sorted(available) if key and key == normalized_key(
+        key = pairing_key(a.get('標準欄位') or a.get('原始欄位'))
+        matching = [j for j in sorted(available) if key[0] and key == pairing_key(
             right_rows[j].get('標準欄位') or right_rows[j].get('原始欄位'))]
         j = matching[0] if matching else None
         b = right_rows[j] if j is not None else {}
@@ -404,6 +470,8 @@ def match_specs(left, right):
         a_value, b_value = clean(a.get('標準數值')), clean(b.get('標準數值'))
         field = clean(a.get('標準欄位') or a.get('原始欄位'))
         state, note = interpret_pair(field, a_value, b_value)
+        if j is None and key[1]:
+            note = '未找到相同適用條件的對照數值；其他容量/版本可能有資料，請人工核對'
         output.append({'比較項目': field, '產品A數值': a_value, '產品B數值': b_value,
                        '比較狀態': state, '產品A原始欄位': clean(a.get('原始欄位')),
                        '產品B原始欄位': clean(b.get('原始欄位')),
@@ -417,7 +485,7 @@ def match_specs(left, right):
                        '比較狀態': '資料不足', '產品A原始欄位': '',
                        '產品B原始欄位': clean(b.get('原始欄位')),
                        '產品A來源': '', '產品B來源': clean(b.get('來源頁碼')),
-                       '人工判讀': '', '備註': '產品 A 未擷取到對應規格；不代表未提供'})
+                       '人工判讀': '', '備註': '未擷取到相同欄位及適用條件；不代表產品未提供此規格'})
     return pd.DataFrame(output, columns=['比較項目', '產品A數值', '產品B數值', '比較狀態',
                                          '產品A原始欄位', '產品B原始欄位',
                                          '產品A來源', '產品B來源', '人工判讀', '備註'])
@@ -438,7 +506,8 @@ def collapse_specs(df):
     for row in df.fillna('').to_dict('records'):
         if clean(row.get('確認狀態')) == '不適用':
             continue
-        field = canonical_field(clean(row.get('標準欄位') or row.get('原始欄位')), row.get('標準數值'))
+        field = normalize_field(clean(row.get('標準欄位') or row.get('原始欄位')))
+        field = canonical_field(field, row.get('標準數值'))
         if not field: continue
         groups.setdefault(normalized_key(field), []).append((field,row))
     output=[]
@@ -612,8 +681,8 @@ def excel_bytes(left, right, comparison, names):
     entries=[('產品 A 原始檔',names[0],'來源頁碼詳見核心比較及原始規格資料'),
              ('產品 B 原始檔',names[1],'來源頁碼詳見核心比較及原始規格資料'),
              ('擷取方式','pdfplumber 文字、表格與規則式辨識','目前不支援掃描 PDF OCR'),
-             ('標準化方式','欄位別名映射與人工修正','未知欄位仍保留原名稱'),
-             ('比較方式','同名標準欄位配對與保守規則判讀','不會自動評估產品優劣'),
+             ('標準化方式','AI 固定欄位 ID、同義詞映射與人工修正','未知欄位仍保留原名稱'),
+             ('比較方式','標準化欄位與適用條件配對、保守規則判讀','不會自動評估產品優劣'),
              ('資料不足','表示至少一方未擷取到可用值','不代表產品或 PDF 不存在該規格'),
              ('文字一致','只表示標準數值文字相同','不代表測試條件一致'),
              ('部分一致','有部分共同特性','不代表完全相容或規格相同'),
@@ -626,7 +695,7 @@ def excel_bytes(left, right, comparison, names):
 
 with st.expander('🔍 Gemini API 連線診斷（不需上傳 PDF）', expanded=False):
     st.caption('此測試會傳送一段簡短文字到 Google Gemini，不會傳送 PDF，也不會顯示金鑰。')
-    diagnostic_model = st.text_input('測試模型', value='gemini-2.5-flash', key='diagnostic_model')
+    diagnostic_model = st.text_input('測試模型', value='gemini-3.8-flash', key='diagnostic_model')
     if st.button('測試 Gemini API 金鑰', key='test_gemini_key'):
         diagnostic_key = gemini_key()
         if diagnostic_key:
@@ -654,7 +723,7 @@ mode = st.radio('規格擷取方式', ['規則式（免費、資料不離開網�
 if mode.startswith('Gemini'):
     st.warning('AI 模式會將兩份 PDF 擷取出的文字傳送至 Google Gemini API。請勿上傳機密文件；使用前請確認有權將內容提供第三方處理。')
     consent = st.checkbox('我確認兩份文件可傳送至 Google Gemini API 進行分析。')
-    model_name = st.text_input('Gemini 模型名稱（可依 AI Studio 可用模型調整）', value='gemini-2.5-flash')
+    model_name = st.text_input('Gemini 模型名稱（可依 AI Studio 可用模型調整）', value='gemini-3.8-flash')
     if st.button('✨ 執行 Gemini AI 擷取', disabled=not consent, type='primary'):
         key = gemini_key()
         if not key:
@@ -680,7 +749,7 @@ if mode.startswith('Gemini'):
 
 st.success(f'產品 A：{len(pages_a)} 頁、{len(st.session_state.A_table)} 筆候選規格；'
            f'產品 B：{len(pages_b)} 頁、{len(st.session_state.B_table)} 筆候選規格。')
-st.caption('建議選擇相同用途的產品。若欄位名稱不同，可先修改「標準欄位」為相同名稱，再重新產生比較表。')
+st.caption('v0.8：AI 使用固定規格 ID，程式進行同義詞標準化及適用條件配對；不同容量/版本不強行合併。請人工核對。')
 
 st.subheader('2｜檢視與修正雙方規格')
 left_col, right_col = st.columns(2)
@@ -731,5 +800,5 @@ comparison_edited = st.data_editor(
     key=f'comparison_{st.session_state.A_revision}_{st.session_state.B_revision}')
 st.download_button('📥 下載專業競品分析報告 Excel',
                    data=excel_bytes(edited_a, edited_b, comparison_edited, (file_a.name, file_b.name)),
-                   file_name='industrial_competitor_report_v07.xlsx',
+                   file_name='industrial_competitor_report_v08.xlsx',
                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
