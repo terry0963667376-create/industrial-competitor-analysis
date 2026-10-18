@@ -11,8 +11,8 @@ import pandas as pd
 import pdfplumber
 import streamlit as st
 
-st.set_page_config(page_title='工業規格書｜競品比較 MVP v0.7', page_icon='📊', layout='wide')
-st.title('工業規格書標準化與競品比較｜MVP v0.7')
+st.set_page_config(page_title='工業規格書｜競品比較 MVP v0.7.1', page_icon='📊', layout='wide')
+st.title('工業規格書標準化與競品比較｜MVP v0.7.1')
 st.caption('雙 PDF 動態擷取 → 人工修正 → 規格配對 → Excel 比較報告｜規則式／Gemini AI 雙模式；AI 結果需人工確認')
 st.info('僅支援有文字層的 PDF；比較結果為候選資料，須人工確認。請上傳公開或有權使用的文件。')
 
@@ -229,6 +229,50 @@ def gemini_key():
     except Exception:
         st.error("無法讀取 Streamlit Secrets")
         return ""
+
+
+def gemini_connection_test(api_key, model_name='gemini-2.5-flash'):
+    """Minimal independent Gemini request. Never include API key in output."""
+    if not re.fullmatch(r'[a-zA-Z0-9._-]+', model_name):
+        return False, '模型名稱格式不正確。'
+    url = ('https://generativelanguage.googleapis.com/v1beta/models/'
+           + model_name + ':generateContent')
+    payload = {'contents': [{'parts': [{'text': 'Reply with OK only.'}]}],
+               'generationConfig': {'maxOutputTokens': 16}}
+    request = urllib.request.Request(
+        url, data=json.dumps(payload).encode('utf-8'), method='POST',
+        headers={'Content-Type': 'application/json', 'x-goog-api-key': api_key})
+    try:
+        with urllib.request.urlopen(request, timeout=25) as response:
+            data = json.load(response)
+        parts = data.get('candidates', [{}])[0].get('content', {}).get('parts', [])
+        reply = ''.join(p.get('text', '') for p in parts).strip()
+        return True, f'Gemini API 連線成功（HTTP 200）。模型回覆：{reply[:80] or "空白回覆"}'
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode('utf-8', errors='replace')
+        try:
+            error = json.loads(raw).get('error', {})
+            reasons = [d.get('reason', '') for d in error.get('details', []) if isinstance(d, dict)]
+            reason = next((r for r in reasons if r), '')
+            message = str(error.get('message', ''))
+        except (ValueError, TypeError):
+            reason, message = '', ''
+        # Never echo arbitrary server text, which could include request details.
+        if reason == 'API_KEY_INVALID' or 'API key not valid' in message:
+            advice = 'API_KEY_INVALID：Google 不接受目前金鑰。請檢查 AI Studio 金鑰、專案與金鑰限制。'
+        elif exc.code == 403:
+            advice = 'HTTP 403：請檢查 API 權限、金鑰應用程式限制及專案設定。'
+        elif exc.code == 429:
+            advice = 'HTTP 429：請檢查免費額度或呼叫速率限制。'
+        elif exc.code == 404:
+            advice = 'HTTP 404：模型名稱或 API 版本可能不支援。'
+        else:
+            advice = f'HTTP {exc.code}：Google 拒絕請求；請查看 Streamlit 日誌或 Google Cloud 設定。'
+        return False, advice
+    except (urllib.error.URLError, TimeoutError):
+        return False, '連線逾時或網路錯誤，請稍後再試。'
+    except Exception:
+        return False, '測試發生非預期錯誤，請查看 Streamlit 日誌（勿公開金鑰）。'
 
 
 def ai_extract(pages, api_key, model_name):
@@ -579,6 +623,19 @@ def excel_bytes(left, right, comparison, names):
     for i,entry in enumerate(entries,4): body(sources,i,entry)
     setup(sources,[26,68,78],freeze='A4')
     out=io.BytesIO(); wb.save(out); return out.getvalue()
+
+with st.expander('🔍 Gemini API 連線診斷（不需上傳 PDF）', expanded=False):
+    st.caption('此測試會傳送一段簡短文字到 Google Gemini，不會傳送 PDF，也不會顯示金鑰。')
+    diagnostic_model = st.text_input('測試模型', value='gemini-2.5-flash', key='diagnostic_model')
+    if st.button('測試 Gemini API 金鑰', key='test_gemini_key'):
+        diagnostic_key = gemini_key()
+        if diagnostic_key:
+            with st.spinner('正在測試 Gemini API…'):
+                ok, result = gemini_connection_test(diagnostic_key, diagnostic_model)
+            if ok:
+                st.success(result)
+            else:
+                st.error(result)
 
 st.subheader('1｜上傳兩份產品規格書')
 a_col, b_col = st.columns(2)
